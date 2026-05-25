@@ -1,0 +1,13 @@
+[package]
+name = "llm-think-tag-strip"
+version = "0.1.0"
+edition = "2021"
+description = "Strip <thinking>/<think> reasoning blocks from LLM output (Claude, DeepSeek, etc.)"
+license = "MIT"
+repository = "https://github.com/MukundaKatta/llm-think-tag-strip-rs"
+keywords = ["llm", "thinking", "claude", "deepseek", "strip"]
+categories = ["text-processing"]
+exclude = ["target/*", ".github/*", "*.log"]
+
+[dependencies]
+regex = "1"
