@@ -28,6 +28,7 @@ pub struct StrippedResult {
     pub clean: String,
     /// Extracted thinking block bodies in source order.
     pub thinking: Vec<String>,
+    /// `true` if at least one thinking block was found and removed.
     pub had_thinking: bool,
 }
 
@@ -67,7 +68,8 @@ fn markdown_closed_re(tag: &str) -> Regex {
     let escaped = regex::escape(tag);
     Regex::new(&format!(
         r"(?is)#{{1,6}}\s*{escaped}\s*\n(.*?)\n#{{1,6}}\s*end\s+{escaped}\s*(?:\n|$)"
-    )).unwrap()
+    ))
+    .unwrap()
 }
 
 fn angle_unclosed_re(tag: &str) -> Regex {
@@ -85,15 +87,48 @@ fn markdown_unclosed_re(tag: &str) -> Regex {
     Regex::new(&format!(r"(?is)#{{1,6}}\s*{escaped}\s*\n(.*)\z")).unwrap()
 }
 
+// ---- closed-match collection ----------------------------------------------
+
+/// A located closed thinking block: byte range in the source plus its body.
+struct ClosedMatch {
+    start: usize,
+    end: usize,
+    body: String,
+}
+
+/// Push every non-overlapping match of `re` in `text` into `out`.
+///
+/// Group 0 spans the whole block (used to know what to delete) and group 1
+/// captures the trimmed body that becomes an extracted thinking entry.
+fn collect_closed(re: &Regex, text: &str, out: &mut Vec<ClosedMatch>) {
+    for caps in re.captures_iter(text) {
+        let whole = caps.get(0).unwrap();
+        out.push(ClosedMatch {
+            start: whole.start(),
+            end: whole.end(),
+            body: caps[1].trim().to_owned(),
+        });
+    }
+}
+
 // ---- Stripper -------------------------------------------------------------
 
-/// Reusable stripper with pre-compiled patterns.
+/// Reusable stripper holding the configured tag list and syntax options.
+///
+/// Construct one with [`Stripper::new`] and call [`Stripper::strip`] for each
+/// piece of text. The convenience functions [`strip_thinking`] and
+/// [`extract_thinking`] build a `Stripper` on every call, so prefer reusing a
+/// `Stripper` when processing many inputs with the same configuration.
 pub struct Stripper {
+    /// Tag names to recognize, e.g. `["thinking", "think"]`.
     tags: Vec<String>,
+    /// When `true`, also strip `### Thinking ... ### End thinking` blocks.
     markdown_style: bool,
 }
 
 impl Stripper {
+    /// Create a stripper for the given `tags`, optionally enabling the
+    /// markdown-heading syntax (`### Thinking ... ### End thinking`).
     pub fn new(tags: &[&str], markdown_style: bool) -> Self {
         Self {
             tags: tags.iter().map(|s| s.to_string()).collect(),
@@ -101,38 +136,54 @@ impl Stripper {
         }
     }
 
+    /// Strip every recognized thinking block from `text`.
+    ///
+    /// Closed blocks are removed in source order. A single trailing *unclosed*
+    /// block (an opening tag with no matching close) is treated as "everything
+    /// from the tag to the end of the string is thinking" and dropped.
     pub fn strip(&self, text: &str) -> StrippedResult {
         if text.is_empty() {
-            return StrippedResult { clean: String::new(), thinking: vec![], had_thinking: false };
+            return StrippedResult {
+                clean: String::new(),
+                thinking: vec![],
+                had_thinking: false,
+            };
         }
 
         let mut thinking: Vec<String> = Vec::new();
-        let mut out = text.to_owned();
 
         // --- closed blocks ---
+        //
+        // Collect every closed-block match across all tags and all enabled
+        // syntaxes, then process them strictly in source order. Iterating one
+        // tag at a time (e.g. all `thinking` blocks, then all `think` blocks)
+        // would reorder the extracted bodies when different tags interleave,
+        // breaking the "source order" guarantee.
+        let mut matches: Vec<ClosedMatch> = Vec::new();
         for tag in &self.tags {
-            let re = angle_closed_re(tag);
-            out = re.replace_all(&out, |caps: &regex::Captures| {
-                thinking.push(caps[1].trim().to_owned());
-                String::new()
-            }).into_owned();
-        }
-        for tag in &self.tags {
-            let re = pipe_closed_re(tag);
-            out = re.replace_all(&out, |caps: &regex::Captures| {
-                thinking.push(caps[1].trim().to_owned());
-                String::new()
-            }).into_owned();
-        }
-        if self.markdown_style {
-            for tag in &self.tags {
-                let re = markdown_closed_re(tag);
-                out = re.replace_all(&out, |caps: &regex::Captures| {
-                    thinking.push(caps[1].trim().to_owned());
-                    String::new()
-                }).into_owned();
+            collect_closed(&angle_closed_re(tag), text, &mut matches);
+            collect_closed(&pipe_closed_re(tag), text, &mut matches);
+            if self.markdown_style {
+                collect_closed(&markdown_closed_re(tag), text, &mut matches);
             }
         }
+        // Sort by start offset; on ties prefer the longer span so an outer
+        // block wins over a nested/overlapping inner one.
+        matches.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+
+        // Rebuild the string, dropping non-overlapping matches in order.
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        for m in &matches {
+            if m.start < cursor {
+                // Overlaps a span we already removed; skip it.
+                continue;
+            }
+            out.push_str(&text[cursor..m.start]);
+            thinking.push(m.body.clone());
+            cursor = m.end;
+        }
+        out.push_str(&text[cursor..]);
 
         // --- unclosed blocks (at most one, from first match to end of string) ---
         'unclosed: for tag in &self.tags {
@@ -168,7 +219,11 @@ impl Stripper {
 
         let had_thinking = !thinking.is_empty();
         let clean = collapse_whitespace(&out);
-        StrippedResult { clean, thinking, had_thinking }
+        StrippedResult {
+            clean,
+            thinking,
+            had_thinking,
+        }
     }
 }
 
@@ -303,5 +358,54 @@ mod tests {
     fn had_thinking_false_when_none() {
         let r = strip("plain text");
         assert!(!r.had_thinking);
+    }
+
+    #[test]
+    fn interleaved_different_tags_preserve_source_order() {
+        // `<think>` appears before `<thinking>` in the source, so the
+        // extracted bodies must come back as ["a", "b"], not ["b", "a"].
+        let r = strip("<think>a</think>x<thinking>b</thinking>y");
+        assert_eq!(r.thinking, vec!["a", "b"]);
+        assert_eq!(r.clean, "xy");
+    }
+
+    #[test]
+    fn interleaved_angle_and_pipe_preserve_source_order() {
+        let r = strip("<|thinking|>p</|thinking|>m<thinking>q</thinking>n");
+        assert_eq!(r.thinking, vec!["p", "q"]);
+        assert_eq!(r.clean, "mn");
+    }
+
+    #[test]
+    fn reuse_stripper_across_inputs() {
+        let s = Stripper::new(DEFAULT_TAGS, false);
+        let a = s.strip("<thinking>1</thinking>A");
+        let b = s.strip("<thinking>2</thinking>B");
+        assert_eq!(a.thinking, vec!["1"]);
+        assert_eq!(b.thinking, vec!["2"]);
+        assert_eq!(a.clean, "A");
+        assert_eq!(b.clean, "B");
+    }
+
+    #[test]
+    fn closed_block_with_unicode_body() {
+        // Ensures byte-offset slicing respects char boundaries.
+        let r = strip("café <thinking>réfléchir 🤔</thinking>déjà");
+        assert_eq!(r.thinking, vec!["réfléchir 🤔"]);
+        assert_eq!(r.clean, "café déjà");
+    }
+
+    #[test]
+    fn closed_then_unclosed_combination() {
+        let r = strip("<thinking>first</thinking>middle <thinking>tail");
+        assert_eq!(r.thinking, vec!["first", "tail"]);
+        assert_eq!(r.clean, "middle");
+    }
+
+    #[test]
+    fn three_interleaved_blocks_in_order() {
+        let r = strip("<thinking>1</thinking>a<think>2</think>b<thinking>3</thinking>c");
+        assert_eq!(r.thinking, vec!["1", "2", "3"]);
+        assert_eq!(r.clean, "abc");
     }
 }
